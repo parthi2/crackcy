@@ -1,5 +1,6 @@
 <?php
-require_once 'includes/header.php';
+// 1. INCLUDE DATABASE & SESSION CONFIGURATION FIRST
+require_once '../config/database.php';
 
 $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
 
@@ -23,10 +24,6 @@ $allProducts = $pdo->query("SELECT * FROM products WHERE status = 1 ORDER BY pro
 
 $errors = [];
 
-// Default GST values if missing
-$currentGstPercent = isset($order['gst_percent']) && $order['gst_percent'] > 0 ? (float)$order['gst_percent'] : 18.00;
-$isGstEnabled = ($order['gst_amount'] > 0 || !isset($order['gst_amount']));
-
 // Handle Form Update & Mail Dispatch
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
     $customer_name  = sanitize($_POST['customer_name'] ?? '');
@@ -38,12 +35,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
     $pincode        = sanitize($_POST['pincode'] ?? '');
     $notes          = sanitize($_POST['notes'] ?? '');
     $order_status   = sanitize($_POST['order_status'] ?? 'Pending');
-    $apply_gst      = isset($_POST['apply_gst']) ? true : false;
-    $gst_percent    = $apply_gst ? (float)($_POST['gst_percent'] ?? 18.00) : 0.00;
     $quantities     = $_POST['quantities'] ?? [];
     $delete_items   = $_POST['delete_items'] ?? [];
-    $new_product    = (int)($_POST['new_product_id'] ?? 0);
-    $new_qty        = (int)($_POST['new_product_qty'] ?? 0);
+    $new_products   = $_POST['new_products'] ?? []; 
     $send_email     = isset($_POST['send_email']) ? true : false;
 
     if (empty($customer_name)) $errors[] = "Customer Name is required.";
@@ -72,34 +66,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
                 }
             }
 
-            // 2. Add New Product
-            if ($new_product > 0 && $new_qty > 0) {
-                $pStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
-                $pStmt->execute([':id' => $new_product]);
-                $pData = $pStmt->fetch();
+            // 2. Add Multiple New Products
+            if (!empty($new_products) && is_array($new_products)) {
+                $addItem = $pdo->prepare("
+                    INSERT INTO order_items (order_id, product_id, product_name, price, quantity, subtotal)
+                    VALUES (:order_id, :product_id, :product_name, :price, :quantity, :subtotal)
+                ");
 
-                if ($pData) {
-                    $subtotal = $pData['price'] * $new_qty;
-                    $itemsSubtotal += $subtotal;
+                foreach ($new_products as $np) {
+                    $prodId = (int)($np['product_id'] ?? 0);
+                    $prodQty = (int)($np['quantity'] ?? 0);
 
-                    $addItem = $pdo->prepare("
-                        INSERT INTO order_items (order_id, product_id, product_name, price, quantity, subtotal)
-                        VALUES (:order_id, :product_id, :product_name, :price, :quantity, :subtotal)
-                    ");
-                    $addItem->execute([
-                        ':order_id'     => $id,
-                        ':product_id'   => $pData['id'],
-                        ':product_name' => $pData['product_name'],
-                        ':price'        => $pData['price'],
-                        ':quantity'     => $new_qty,
-                        ':subtotal'     => $subtotal
-                    ]);
+                    if ($prodId > 0 && $prodQty > 0) {
+                        $pStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+                        $pStmt->execute([':id' => $prodId]);
+                        $pData = $pStmt->fetch();
+
+                        if ($pData) {
+                            $subtotal = $pData['price'] * $prodQty;
+                            $itemsSubtotal += $subtotal;
+
+                            $addItem->execute([
+                                ':order_id'     => $id,
+                                ':product_id'   => $pData['id'],
+                                ':product_name' => $pData['product_name'],
+                                ':price'        => $pData['price'],
+                                ':quantity'     => $prodQty,
+                                ':subtotal'     => $subtotal
+                            ]);
+                        }
+                    }
                 }
             }
 
-            // 3. GST Calculation
-            $gstAmount = $apply_gst ? ($itemsSubtotal * ($gst_percent / 100)) : 0.00;
-            $grandTotal = $itemsSubtotal + $gstAmount;
+            // 3. Grand Total Calculation (GST Removed)
+            $grandTotal = $itemsSubtotal;
 
             // 4. Update Order Table
             $uOrder = $pdo->prepare("
@@ -107,7 +108,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
                 SET customer_name = :name, phone = :phone, email = :email, address = :address, 
                     city = :city, state = :state, pincode = :pincode, notes = :notes, 
                     order_status = :status, subtotal_amount = :subtotal_amount, 
-                    gst_percent = :gst_percent, gst_amount = :gst_amount, total_amount = :total
+                    gst_percent = 0.00, gst_amount = 0.00, total_amount = :total
                 WHERE id = :id
             ");
             $uOrder->execute([
@@ -121,8 +122,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
                 ':notes'           => $notes,
                 ':status'          => $order_status,
                 ':subtotal_amount' => $itemsSubtotal,
-                ':gst_percent'     => $gst_percent,
-                ':gst_amount'      => $gstAmount,
                 ':total'           => $grandTotal,
                 ':id'              => $id
             ]);
@@ -177,11 +176,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
                 $message .= "
                             </tbody>
                         </table>
-                        <p>Items Subtotal: ₹" . number_format($itemsSubtotal, 2) . "</p>";
-                if ($apply_gst) {
-                    $message .= "<p>GST (" . $gst_percent . "%): ₹" . number_format($gstAmount, 2) . "</p>";
-                }
-                $message .= "
                         <p class='total'>Grand Total: ₹" . number_format($grandTotal, 2) . "</p>
                         <p><strong>Shipping Address:</strong><br>" . nl2br(htmlspecialchars($address)) . "<br>" . htmlspecialchars($city) . ", " . htmlspecialchars($state) . " - " . htmlspecialchars($pincode) . "</p>
                     </div>
@@ -206,7 +200,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
         }
     }
 }
+
+// NOW SAFE TO INCLUDE HTML HEADER AFTER REDIRECTS ARE PROCESSED
+require_once 'includes/header.php';
 ?>
+
+<style>
+.searchable-dropdown-container {
+    position: relative;
+    width: 100%;
+}
+.searchable-dropdown-list {
+    position: fixed;
+    max-height: 220px;
+    overflow-y: auto;
+    background: #ffffff;
+    border: 1px solid #ced4da;
+    border-radius: 0.375rem;
+    box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+    z-index: 99999;
+    display: none;
+}
+.searchable-dropdown-item {
+    padding: 10px 14px;
+    cursor: pointer;
+    font-size: 0.875rem;
+    border-bottom: 1px solid #f1f1f1;
+    color: #333;
+}
+.searchable-dropdown-item:hover {
+    background-color: #f8f9fa;
+    color: #0d6efd;
+}
+</style>
 
 <div class="d-flex justify-content-between align-items-center mb-4">
     <h2 class="fw-bold"><i class="fa-solid fa-pen-to-square me-2"></i>Edit Order: <?= sanitize($order['order_no']); ?></h2>
@@ -226,7 +252,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
             <div class="card shadow-sm border-0 mb-4">
                 <div class="card-header bg-dark text-white fw-bold d-flex justify-content-between align-items-center">
                     <span>Modify Line Items</span>
-                    <small class="fw-normal text-muted">In-row Add & Remove</small>
+                    <small class="fw-normal text-muted">Search & Add Multiple Products</small>
                 </div>
                 <div class="table-responsive">
                     <table class="table align-middle mb-0">
@@ -241,7 +267,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
                         </thead>
                         <tbody id="lineItemsBody">
                             <?php foreach ($items as $item): ?>
-                                <tr class="order-item-row" data-item-id="<?= $item['id']; ?>">
+                                <tr class="order-item-row" data-item-id="<?= $item['id']; ?>" data-product-id="<?= $item['product_id']; ?>">
                                     <td class="fw-bold"><?= sanitize($item['product_name']); ?></td>
                                     <td>₹<span class="unit-price" data-price="<?= $item['price']; ?>"><?= number_format($item['price'], 2); ?></span></td>
                                     <td>
@@ -259,52 +285,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
                             <?php endforeach; ?>
                         </tbody>
                         <tfoot class="table-light border-top">
-                            <!-- In-row Add New Product Row -->
+                            <!-- Searchable Product Selection Add Row -->
                             <tr class="bg-white">
                                 <td colspan="2">
-                                    <select name="new_product_id" id="newProductSelect" class="form-select form-select-sm">
-                                        <option value="0" data-price="0">-- + Add Product to Row --</option>
-                                        <?php foreach ($allProducts as $ap): ?>
-                                            <option value="<?= $ap['id']; ?>" data-price="<?= $ap['price']; ?>"><?= sanitize($ap['product_name']); ?> (₹<?= number_format($ap['price'], 2); ?>)</option>
-                                        <?php endforeach; ?>
-                                    </select>
-                                </td>
-                                <td>
-                                    <input type="number" name="new_product_qty" id="newProductQty" class="form-control form-control-sm text-center" value="1" min="1" placeholder="Qty">
-                                </td>
-                                <td colspan="2" class="text-end">
-                                    <span class="text-muted small me-2">Selected Subtotal:</span>
-                                    <strong class="text-primary">₹<span id="newProductSubtotalDisplay">0.00</span></strong>
-                                </td>
-                            </tr>
-
-                            <!-- Subtotal -->
-                            <tr>
-                                <td colspan="3" class="text-end fw-bold">Items Subtotal:</td>
-                                <td class="text-end fw-bold text-dark" colspan="2">₹<span id="calc-items-subtotal">0.00</span></td>
-                            </tr>
-
-                            <!-- GST Row -->
-                            <tr>
-                                <td colspan="3" class="text-end fw-bold">
-                                    <div class="d-flex align-items-center justify-content-end gap-2">
-                                        <div class="form-check form-switch m-0">
-                                            <input class="form-check-input" type="checkbox" name="apply_gst" id="applyGstCheckbox" <?= $isGstEnabled ? 'checked' : ''; ?>>
-                                            <label class="form-check-label fw-bold" for="applyGstCheckbox">Apply GST Tax</label>
-                                        </div>
-                                        <div class="input-group input-group-sm ms-2" style="width: 100px;">
-                                            <input type="number" step="0.01" name="gst_percent" id="gstPercentInput" class="form-control text-center" value="<?= $currentGstPercent; ?>">
-                                            <span class="input-group-text">%</span>
+                                    <div class="searchable-dropdown-container">
+                                        <input type="text" id="productSearchInput" class="form-control form-control-sm" placeholder="🔍 Type to search product..." autocomplete="off">
+                                        <input type="hidden" id="selectedProductId" value="0">
+                                        <input type="hidden" id="selectedProductPrice" value="0">
+                                        <input type="hidden" id="selectedProductName" value="">
+                                        <div id="productDropdownList" class="searchable-dropdown-list">
+                                            <?php foreach ($allProducts as $ap): ?>
+                                                <div class="searchable-dropdown-item" data-id="<?= $ap['id']; ?>" data-price="<?= $ap['price']; ?>" data-name="<?= sanitize($ap['product_name']); ?>">
+                                                    <?= sanitize($ap['product_name']); ?> — <strong class="text-success">₹<?= number_format($ap['price'], 2); ?></strong>
+                                                </div>
+                                            <?php endforeach; ?>
                                         </div>
                                     </div>
                                 </td>
-                                <td class="text-end fw-bold text-warning" colspan="2">₹<span id="calc-gst-amount">0.00</span></td>
+                                <td>
+                                    <input type="number" id="quickProductQty" class="form-control form-control-sm text-center" value="1" min="1" placeholder="Qty">
+                                </td>
+                                <td colspan="2" class="text-center">
+                                    <button type="button" id="btnAddProductRow" class="btn btn-sm btn-success w-100 fw-bold">
+                                        <i class="fa-solid fa-plus me-1"></i> Add to List
+                                    </button>
+                                </td>
+                            </tr>
+
+                            <!-- Newly Added Dynamic Items Container Header -->
+                            <tr id="newItemsHeaderRow" style="display: none;">
+                                <td colspan="5" class="bg-light fw-bold text-secondary small py-1">New Items to Add:</td>
                             </tr>
 
                             <!-- Grand Total -->
-                            <tr class="table-dark text-white">
-                                <td colspan="3" class="text-end fw-bold fs-5">Grand Total (Incl. GST):</td>
-                                <td class="text-end fw-bold fs-5 text-warning" colspan="2">₹<span id="calculated-grand-total">0.00</span></td>
+                            <tr>
+                                <td colspan="3" class="text-end fw-bold">Grand Total:</td>
+                                <td class="text-end fw-bold text-warning fs-5" colspan="2">₹<span id="calculated-grand-total">0.00</span></td>
                             </tr>
                         </tfoot>
                     </table>
@@ -358,10 +374,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
                         <textarea name="notes" class="form-control form-control-sm" rows="2"><?= sanitize($order['notes'] ?? ''); ?></textarea>
                     </div>
 
-                    <div class="form-check form-switch mb-3">
+                    <!-- <div class="form-check form-switch mb-3">
                         <input class="form-check-input" type="checkbox" name="send_email" id="sendEmailSwitch" checked>
                         <label class="form-check-label fw-bold small" for="sendEmailSwitch">Send updated quotation to customer email</label>
-                    </div>
+                    </div> -->
 
                     <button type="submit" name="update_order" class="btn btn-primary w-100 fw-bold"><i class="fa-solid fa-floppy-disk me-1"></i> Save Changes</button>
                 </div>
@@ -372,17 +388,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
 
 <script>
 document.addEventListener('DOMContentLoaded', function () {
-    const newProductSelect = document.getElementById('newProductSelect');
-    const newProductQty = document.getElementById('newProductQty');
-    const newSubtotalDisplay = document.getElementById('newProductSubtotalDisplay');
+    const lineItemsBody = document.getElementById('lineItemsBody');
+    const productSearchInput = document.getElementById('productSearchInput');
+    const productDropdownList = document.getElementById('productDropdownList');
+    const selectedProductId = document.getElementById('selectedProductId');
+    const selectedProductPrice = document.getElementById('selectedProductPrice');
+    const selectedProductName = document.getElementById('selectedProductName');
+    const quickProductQty = document.getElementById('quickProductQty');
+    const btnAddProductRow = document.getElementById('btnAddProductRow');
+    const newItemsHeaderRow = document.getElementById('newItemsHeaderRow');
     const deletedContainer = document.getElementById('deletedItemsContainer');
-    const applyGstCheckbox = document.getElementById('applyGstCheckbox');
-    const gstPercentInput = document.getElementById('gstPercentInput');
+    const grandTotalDisplay = document.getElementById('calculated-grand-total');
+
+    let newProductIndex = 0;
 
     function recalculateOrderTotals() {
         let itemsSubtotal = 0;
 
-        // 1. Calculate existing line items
         document.querySelectorAll('.order-item-row').forEach(row => {
             if (row.style.display !== 'none') {
                 const priceEl = row.querySelector('.unit-price');
@@ -398,51 +420,192 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         });
 
-        // 2. Add extra subtotal if new product selected
-        if (newProductSelect && newProductQty) {
-            const selectedOption = newProductSelect.options[newProductSelect.selectedIndex];
-            const extraPrice = parseFloat(selectedOption.dataset.price) || 0;
-            const extraQty = parseInt(newProductQty.value) || 0;
-            const extraSubtotal = extraPrice * extraQty;
+        document.querySelectorAll('.new-item-row').forEach(row => {
+            const price = parseFloat(row.dataset.price) || 0;
+            const qtyInput = row.querySelector('.new-qty-input');
+            const subtotalEl = row.querySelector('.new-subtotal-val');
 
-            if (newSubtotalDisplay) {
-                newSubtotalDisplay.textContent = extraSubtotal.toFixed(2);
-            }
+            const qty = parseInt(qtyInput.value) || 0;
+            const subtotal = price * qty;
 
-            if (selectedOption.value !== "0" && extraQty > 0) {
-                itemsSubtotal += extraSubtotal;
-            }
+            subtotalEl.textContent = subtotal.toFixed(2);
+            itemsSubtotal += subtotal;
+        });
+
+        if (grandTotalDisplay) {
+            grandTotalDisplay.textContent = itemsSubtotal.toFixed(2);
         }
-
-        // 3. GST Calculations
-        const applyGst = applyGstCheckbox ? applyGstCheckbox.checked : false;
-        const gstPercent = gstPercentInput ? (parseFloat(gstPercentInput.value) || 0) : 0;
-        let gstAmount = 0;
-
-        if (applyGst) {
-            gstAmount = itemsSubtotal * (gstPercent / 100);
-            gstPercentInput.disabled = false;
-        } else {
-            gstPercentInput.disabled = true;
-        }
-
-        const grandTotal = itemsSubtotal + gstAmount;
-
-        // Update UI
-        document.getElementById('calc-items-subtotal').textContent = itemsSubtotal.toFixed(2);
-        document.getElementById('calc-gst-amount').textContent = gstAmount.toFixed(2);
-        document.getElementById('calculated-grand-total').textContent = grandTotal.toFixed(2);
     }
 
-    // Input Listeners
-    document.querySelectorAll('.edit-qty-input').forEach(input => {
-        input.addEventListener('input', recalculateOrderTotals);
+    // Hide already selected products from the searchable dropdown list
+    function updateDropdownAvailability() {
+        const activeProductIds = new Set();
+
+        // Check active database rows (that aren't deleted)
+        document.querySelectorAll('.order-item-row').forEach(row => {
+            if (row.style.display !== 'none') {
+                activeProductIds.add(String(row.dataset.productId));
+            }
+        });
+
+        // Check newly added custom rows
+        document.querySelectorAll('.new-item-row').forEach(row => {
+            const hiddenInput = row.querySelector('input[type="hidden"]');
+            if (hiddenInput) {
+                // Extract product_id from input name like new_products[0][product_id]
+                const match = hiddenInput.name.match(/\[(\d+)\]\[product_id\]/);
+                if (match) {
+                    const prodId = hiddenInput.value;
+                    activeProductIds.add(String(prodId));
+                }
+            }
+        });
+
+        // Loop dropdown items and hide/show based on existence
+        const dropdownItems = productDropdownList.querySelectorAll('.searchable-dropdown-item');
+        dropdownItems.forEach(item => {
+            const itemId = String(item.dataset.id);
+            if (activeProductIds.has(itemId)) {
+                item.style.display = 'none';
+                item.classList.add('already-added');
+            } else {
+                item.style.display = 'block';
+                item.classList.remove('already-added');
+            }
+        });
+    }
+
+    function showDropdownList() {
+        updateDropdownAvailability();
+        const rect = productSearchInput.getBoundingClientRect();
+        productDropdownList.style.top = (rect.bottom + 4) + 'px';
+        productDropdownList.style.left = rect.left + 'px';
+        productDropdownList.style.width = rect.width + 'px';
+        productDropdownList.style.display = 'block';
+    }
+
+    productSearchInput.addEventListener('focus', function () {
+        showDropdownList();
     });
 
-    document.querySelectorAll('.btn-delete-row').forEach(btn => {
-        btn.addEventListener('click', function () {
-            const itemId = this.dataset.id;
-            const row = this.closest('.order-item-row');
+    productSearchInput.addEventListener('input', function () {
+        const filter = productSearchInput.value.toLowerCase().trim();
+        const items = productDropdownList.querySelectorAll('.searchable-dropdown-item');
+        let hasMatches = false;
+
+        items.forEach(item => {
+            if (item.classList.contains('already-added')) {
+                item.style.display = 'none';
+                return;
+            }
+            const text = item.textContent.toLowerCase();
+            if (text.includes(filter)) {
+                item.style.display = 'block';
+                hasMatches = true;
+            } else {
+                item.style.display = 'none';
+            }
+        });
+
+        if (hasMatches) {
+            showDropdownList();
+        } else {
+            productDropdownList.style.display = 'none';
+        }
+    });
+
+    window.addEventListener('resize', function() {
+        if (productDropdownList.style.display === 'block') {
+            showDropdownList();
+        }
+    });
+
+    window.addEventListener('scroll', function() {
+        if (productDropdownList.style.display === 'block') {
+            showDropdownList();
+        }
+    });
+
+    productDropdownList.addEventListener('click', function (e) {
+        const item = e.target.closest('.searchable-dropdown-item');
+        if (item) {
+            selectedProductId.value = item.dataset.id;
+            selectedProductPrice.value = item.dataset.price;
+            selectedProductName.value = item.dataset.name;
+            productSearchInput.value = item.dataset.name + ' (₹' + parseFloat(item.dataset.price).toFixed(2) + ')';
+            productDropdownList.style.display = 'none';
+        }
+    });
+
+    document.addEventListener('click', function (e) {
+        if (!productSearchInput.contains(e.target) && !productDropdownList.contains(e.target)) {
+            productDropdownList.style.display = 'none';
+        }
+    });
+
+    if (btnAddProductRow) {
+        btnAddProductRow.addEventListener('click', function () {
+            const prodId = selectedProductId.value;
+            const prodName = selectedProductName.value;
+            const prodPrice = parseFloat(selectedProductPrice.value) || 0;
+            const prodQty = parseInt(quickProductQty.value) || 1;
+
+            if (prodId === "0" || !prodName) {
+                alert("Please search and select a valid product from the dropdown list.");
+                return;
+            }
+
+            newItemsHeaderRow.style.display = '';
+
+            const subtotal = prodPrice * prodQty;
+            const newRow = document.createElement('tr');
+            newRow.className = 'new-item-row table-success bg-opacity-25';
+            newRow.dataset.price = prodPrice;
+
+            newRow.innerHTML = `
+                <td class="fw-bold text-success">
+                    <i class="fa-solid fa-circle-plus me-1"></i> ${prodName}
+                    <input type="hidden" name="new_products[${newProductIndex}][product_id]" value="${prodId}">
+                </td>
+                <td>₹${prodPrice.toFixed(2)}</td>
+                <td>
+                    <input type="number" name="new_products[${newProductIndex}][quantity]" class="form-control form-control-sm text-center new-qty-input" value="${prodQty}" min="1">
+                </td>
+                <td class="text-end fw-bold text-success">
+                    ₹<span class="new-subtotal-val">${subtotal.toFixed(2)}</span>
+                </td>
+                <td class="text-center">
+                    <button type="button" class="btn btn-sm btn-outline-danger btn-remove-new-row" title="Remove">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </td>
+            `;
+
+            lineItemsBody.appendChild(newRow);
+            newProductIndex++;
+
+            productSearchInput.value = "";
+            selectedProductId.value = "0";
+            selectedProductPrice.value = "0";
+            selectedProductName.value = "";
+            quickProductQty.value = "1";
+
+            recalculateOrderTotals();
+            updateDropdownAvailability();
+        });
+    }
+
+    document.addEventListener('input', function (e) {
+        if (e.target.classList.contains('edit-qty-input') || e.target.classList.contains('new-qty-input')) {
+            recalculateOrderTotals();
+        }
+    });
+
+    document.addEventListener('click', function (e) {
+        if (e.target.closest('.btn-delete-row')) {
+            const btn = e.target.closest('.btn-delete-row');
+            const itemId = btn.dataset.id;
+            const row = btn.closest('.order-item-row');
 
             const hiddenInput = document.createElement('input');
             hiddenInput.type = 'hidden';
@@ -452,15 +615,23 @@ document.addEventListener('DOMContentLoaded', function () {
 
             row.style.display = 'none';
             recalculateOrderTotals();
-        });
+            updateDropdownAvailability();
+        }
+
+        if (e.target.closest('.btn-remove-new-row')) {
+            const row = e.target.closest('.new-item-row');
+            row.remove();
+
+            if (document.querySelectorAll('.new-item-row').length === 0) {
+                newItemsHeaderRow.style.display = 'none';
+            }
+            recalculateOrderTotals();
+            updateDropdownAvailability();
+        }
     });
 
-    if (newProductSelect) newProductSelect.addEventListener('change', recalculateOrderTotals);
-    if (newProductQty) newProductQty.addEventListener('input', recalculateOrderTotals);
-    if (applyGstCheckbox) applyGstCheckbox.addEventListener('change', recalculateOrderTotals);
-    if (gstPercentInput) gstPercentInput.addEventListener('input', recalculateOrderTotals);
-
     recalculateOrderTotals();
+    updateDropdownAvailability();
 });
 </script>
 

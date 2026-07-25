@@ -58,7 +58,7 @@ $isGstApplied = ($gstAmount > 0.00);
     <!-- Header Section -->
     <div class="row border-bottom pb-3 mb-3">
         <div class="col-6">
-            <h2 class="fw-bold">RetailStore</h2>
+            <h2 class="fw-bold">Crackcy</h2>
             <p class="text-muted mb-0">123 Business Parkway, Suite 100<br>Chennai, TN, India</p>
         </div>
         <div class="col-6 text-end">
